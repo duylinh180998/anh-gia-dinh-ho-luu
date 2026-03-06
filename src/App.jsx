@@ -1,4 +1,4 @@
-import { BrowserRouter, Routes, Route, NavLink, useLocation } from 'react-router-dom';
+import { HashRouter, Routes, Route, NavLink, useLocation } from 'react-router-dom';
 import { useEffect } from 'react';
 import { Toaster } from 'react-hot-toast';
 import GalleryPage from './pages/GalleryPage';
@@ -109,8 +109,8 @@ function Shell() {
 
 export default function App() {
   return (
-    <BrowserRouter basename={import.meta.env.BASE_URL}>
+    <HashRouter>
       <Shell />
-    </BrowserRouter>
+    </HashRouter>
   );
 }
