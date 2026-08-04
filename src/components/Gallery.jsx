@@ -4,42 +4,87 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { MasonryPhotoAlbum } from 'react-photo-album';
 import 'react-photo-album/masonry.css';
 import { s3Client, BUCKET_NAME } from '../aws-config';
+import { toThumbKey, toImageStem, stemFromThumbKey } from '../utils/images';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const IMAGE_EXTENSIONS = /\.(jpe?g|png|gif|webp|avif)$/i;
 const S3_PREFIX = '2026/';
+const THUMB_PREFIX = 'thumbs/2026/';
 const PAGE_SIZE = 20;
+/** Placeholder aspect ratio until real size is known from img onLoad. */
+const DEFAULT_WIDTH = 4;
+const DEFAULT_HEIGHT = 3;
+/** First N grid images load eagerly for faster LCP. */
+const EAGER_COUNT = 6;
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-function getImageDimensions(src) {
-    return new Promise((resolve) => {
-        const img = new Image();
-        img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
-        img.onerror = () => resolve({ width: 4, height: 3 });
-        img.src = src;
-    });
+async function signGet(key) {
+    return getSignedUrl(
+        s3Client,
+        new GetObjectCommand({ Bucket: BUCKET_NAME, Key: key }),
+        { expiresIn: 3600 }
+    );
 }
 
-async function fetchPage(continuationToken) {
-    const command = new ListObjectsV2Command({
-        Bucket: BUCKET_NAME,
-        Prefix: S3_PREFIX,
-        MaxKeys: PAGE_SIZE,
-        ContinuationToken: continuationToken,
-    });
+/** Cached set of image stems that have a thumb on S3 (avoids 404 img requests). */
+let thumbStemCache = null;
 
-    const response = await s3Client.send(command);
+export function invalidateThumbCache() {
+    thumbStemCache = null;
+}
+
+async function getExistingThumbStems() {
+    if (thumbStemCache) return thumbStemCache;
+    const stems = new Set();
+    let token;
+    do {
+        const res = await s3Client.send(
+            new ListObjectsV2Command({
+                Bucket: BUCKET_NAME,
+                Prefix: THUMB_PREFIX,
+                ContinuationToken: token,
+            })
+        );
+        for (const obj of res.Contents ?? []) {
+            stems.add(stemFromThumbKey(obj.Key));
+        }
+        token = res.IsTruncated ? res.NextContinuationToken : undefined;
+    } while (token);
+    thumbStemCache = stems;
+    return stems;
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+async function fetchPage(continuationToken) {
+    const [response, thumbStems] = await Promise.all([
+        s3Client.send(
+            new ListObjectsV2Command({
+                Bucket: BUCKET_NAME,
+                Prefix: S3_PREFIX,
+                MaxKeys: PAGE_SIZE,
+                ContinuationToken: continuationToken,
+            })
+        ),
+        getExistingThumbStems(),
+    ]);
+
     const imageObjs = (response.Contents ?? []).filter((o) => IMAGE_EXTENSIONS.test(o.Key));
 
+    // Only request thumb URLs that actually exist — missing thumbs caused Network (failed)
     const photos = await Promise.all(
         imageObjs.map(async (obj) => {
-            const src = await getSignedUrl(
-                s3Client,
-                new GetObjectCommand({ Bucket: BUCKET_NAME, Key: obj.Key }),
-                { expiresIn: 3600 }
-            );
-            const { width, height } = await getImageDimensions(src);
-            return { src, key: obj.Key, width, height, alt: obj.Key.split('/').pop() };
+            const fullSrc = await signGet(obj.Key);
+            const hasThumb = thumbStems.has(toImageStem(obj.Key));
+            const src = hasThumb ? await signGet(toThumbKey(obj.Key)) : fullSrc;
+            return {
+                src,
+                fullSrc,
+                hasThumb,
+                key: obj.Key,
+                width: DEFAULT_WIDTH,
+                height: DEFAULT_HEIGHT,
+                sized: false,
+                alt: obj.Key.split('/').pop(),
+            };
         })
     );
 
@@ -99,6 +144,40 @@ export default function Gallery({ refreshKey }) {
     const [lightboxIdx, setLightboxIdx] = useState(null);
 
     const sentinelRef = useRef(null);
+    const pendingSizesRef = useRef(new Map());
+    const flushRafRef = useRef(null);
+
+    const updatePhotoSize = useCallback((key, width, height) => {
+        if (!width || !height) return;
+        pendingSizesRef.current.set(key, { width, height });
+        if (flushRafRef.current != null) return;
+        flushRafRef.current = requestAnimationFrame(() => {
+            flushRafRef.current = null;
+            const updates = pendingSizesRef.current;
+            pendingSizesRef.current = new Map();
+            setPhotos((prev) => {
+                let changed = false;
+                const next = prev.map((photo) => {
+                    const u = updates.get(photo.key);
+                    if (!u) return photo;
+                    const ratioDelta = Math.abs(photo.width / photo.height - u.width / u.height);
+                    if (photo.sized && ratioDelta < 0.02) return photo;
+                    changed = true;
+                    if (!photo.sized && ratioDelta < 0.02) {
+                        return { ...photo, sized: true };
+                    }
+                    return { ...photo, width: u.width, height: u.height, sized: true };
+                });
+                return changed ? next : prev;
+            });
+        });
+    }, []);
+
+    useEffect(() => {
+        return () => {
+            if (flushRafRef.current != null) cancelAnimationFrame(flushRafRef.current);
+        };
+    }, []);
 
     const loadPage = useCallback(async (token, isReset = false) => {
         setLoading(true);
@@ -117,6 +196,7 @@ export default function Gallery({ refreshKey }) {
 
     // Reset on refresh
     useEffect(() => {
+        invalidateThumbCache();
         setPhotos([]);
         setNextToken(undefined);
         loadPage(undefined, true);
@@ -208,7 +288,33 @@ export default function Gallery({ refreshKey }) {
                 }}
                 spacing={10}
                 onClick={({ index }) => setLightboxIdx(index)}
+                componentsProps={{
+                    image: { loading: 'lazy', decoding: 'async' },
+                }}
                 render={{
+                    image: (props, { photo, index }) => (
+                        <img
+                            {...props}
+                            loading={index < EAGER_COUNT ? 'eager' : 'lazy'}
+                            fetchPriority={index < EAGER_COUNT ? 'high' : 'auto'}
+                            decoding="async"
+                            className={`${props.className ?? ''} rpa-lazy-img${photo.sized ? ' is-loaded' : ''}`}
+                            onLoad={(e) => {
+                                updatePhotoSize(
+                                    photo.key,
+                                    e.currentTarget.naturalWidth,
+                                    e.currentTarget.naturalHeight
+                                );
+                                e.currentTarget.classList.add('is-loaded');
+                            }}
+                            onError={(e) => {
+                                // Safety net if a thumb was deleted after listing
+                                if (photo.hasThumb && photo.fullSrc && e.currentTarget.src !== photo.fullSrc) {
+                                    e.currentTarget.src = photo.fullSrc;
+                                }
+                            }}
+                        />
+                    ),
                     extras: (_, { photo }) => <PhotoExtras photo={photo} />,
                 }}
             />
@@ -244,8 +350,11 @@ function Lightbox({ photos, index, onClose, onChange }) {
     const [zoom, setZoom] = useState(1);
     const [touchStartX, setTouchStartX] = useState(null);
     const [touchEndX, setTouchEndX] = useState(null);
+    const [fullReady, setFullReady] = useState(false);
 
     const photo = photos[index];
+    const fullUrl = photo?.fullSrc || photo?.src;
+    const thumbUrl = photo?.src;
 
     const goPrev = useCallback(() => {
         setZoom(1);
@@ -256,6 +365,10 @@ function Lightbox({ photos, index, onClose, onChange }) {
         setZoom(1);
         onChange((i) => (i < photos.length - 1 ? i + 1 : 0));
     }, [onChange, photos.length]);
+
+    useEffect(() => {
+        setFullReady(false);
+    }, [photo?.key]);
 
     useEffect(() => {
         const handler = (e) => {
@@ -269,8 +382,22 @@ function Lightbox({ photos, index, onClose, onChange }) {
         return () => window.removeEventListener('keydown', handler);
     }, [onClose, goPrev, goNext]);
 
+    // Prefetch neighbors so swipe/next feels instant
+    useEffect(() => {
+        const prefetch = (i) => {
+            const p = photos[i];
+            const url = p?.fullSrc || p?.src;
+            if (!url) return;
+            const img = new Image();
+            img.src = url;
+        };
+        if (photos.length < 2) return;
+        prefetch((index + 1) % photos.length);
+        prefetch((index - 1 + photos.length) % photos.length);
+    }, [index, photos]);
+
     const onTouchStart = (e) => {
-        setTouchEndX(null); // Reset when starting a new touch
+        setTouchEndX(null);
         setTouchStartX(e.targetTouches[0].clientX);
     };
 
@@ -281,16 +408,8 @@ function Lightbox({ photos, index, onClose, onChange }) {
     const onTouchEnd = () => {
         if (!touchStartX || !touchEndX) return;
         const distance = touchStartX - touchEndX;
-        const isLeftSwipe = distance > 50;
-        const isRightSwipe = distance < -50;
-
-        if (isLeftSwipe) {
-            goNext();
-        }
-        if (isRightSwipe) {
-            goPrev();
-        }
-
+        if (distance > 50) goNext();
+        if (distance < -50) goPrev();
         setTouchStartX(null);
         setTouchEndX(null);
     };
@@ -310,6 +429,11 @@ function Lightbox({ photos, index, onClose, onChange }) {
             <div style={{ position: 'absolute', top: 0, left: 0, right: 0, display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '1rem 1.25rem', zIndex: 20, background: 'linear-gradient(to bottom, rgba(0,0,0,0.6), transparent)', pointerEvents: 'none' }}>
                 <span style={{ color: 'rgba(255,255,255,0.6)', fontSize: '0.875rem', fontWeight: 500, pointerEvents: 'auto' }}>
                     {index + 1} / {photos.length}
+                    {!fullReady && (
+                        <span style={{ marginLeft: '0.75rem', color: 'rgba(255,255,255,0.35)', fontSize: '0.75rem' }}>
+                            Đang tải ảnh gốc…
+                        </span>
+                    )}
                 </span>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', pointerEvents: 'auto' }}>
                     <button onClick={(e) => { e.stopPropagation(); setZoom((z) => Math.max(z - 0.25, 0.5)); }} style={btnStyle} title="Thu nhỏ (-)">
@@ -319,7 +443,7 @@ function Lightbox({ photos, index, onClose, onChange }) {
                     <button onClick={(e) => { e.stopPropagation(); setZoom((z) => Math.min(z + 0.25, 3)); }} style={btnStyle} title="Phóng to (+)">
                         <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
                     </button>
-                    <a href={photo.src} download target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()} style={btnStyle} title="Tải xuống">
+                    <a href={fullUrl} download target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()} style={btnStyle} title="Tải xuống">
                         <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5 5-5M12 15V3" /></svg>
                     </a>
                     <button onClick={onClose} style={{ ...btnStyle, '--btn-hover-bg': 'rgba(239,68,68,0.5)' }} title="Đóng (ESC)">
@@ -328,7 +452,6 @@ function Lightbox({ photos, index, onClose, onChange }) {
                 </div>
             </div>
 
-            {/* Clickable zones for Prev/Next for better UX */}
             <div
                 className="absolute inset-y-0 left-0 w-1/6 md:w-32 z-10 flex items-center justify-start px-4 md:px-8 cursor-pointer group"
                 onClick={(e) => { e.stopPropagation(); goPrev(); }}
@@ -341,16 +464,36 @@ function Lightbox({ photos, index, onClose, onChange }) {
                 </div>
             </div>
 
-            {/* Image container */}
+            {/* Progressive: thumb first (cached), then fade in optimized full */}
             <div className="relative flex items-center justify-center w-full h-full p-4 md:p-12 z-0">
-                <div className="animate-scaleIn w-full h-full flex items-center justify-center">
+                <div
+                    className="animate-scaleIn relative w-full h-full flex items-center justify-center"
+                    style={{ transform: `scale(${zoom})`, transition: 'transform 0.3s cubic-bezier(0.25,0.46,0.45,0.94)' }}
+                    onClick={(e) => e.stopPropagation()}
+                >
                     <img
-                        key={photo.src}
-                        src={photo.src}
+                        key={`thumb-${photo.key}`}
+                        src={thumbUrl}
+                        alt=""
+                        aria-hidden
+                        className="absolute max-w-full max-h-full rounded-xl object-contain"
+                        style={{
+                            filter: fullReady ? 'none' : 'blur(8px)',
+                            transform: fullReady ? 'none' : 'scale(1.04)',
+                            opacity: fullReady ? 0 : 1,
+                            transition: 'opacity 0.35s ease, filter 0.35s ease',
+                        }}
+                    />
+                    <img
+                        key={`full-${photo.key}`}
+                        src={fullUrl}
                         alt={photo.alt}
-                        className="max-w-full max-h-full rounded-xl object-contain shadow-2xl cursor-default"
-                        style={{ transform: `scale(${zoom})`, transition: 'transform 0.3s cubic-bezier(0.25,0.46,0.45,0.94)' }}
-                        onClick={(e) => e.stopPropagation()}
+                        className="relative max-w-full max-h-full rounded-xl object-contain shadow-2xl cursor-default"
+                        style={{
+                            opacity: fullReady ? 1 : 0,
+                            transition: 'opacity 0.35s ease',
+                        }}
+                        onLoad={() => setFullReady(true)}
                     />
                 </div>
             </div>
@@ -367,7 +510,6 @@ function Lightbox({ photos, index, onClose, onChange }) {
                 </div>
             </div>
 
-            {/* Caption */}
             <div className="absolute bottom-0 inset-x-0 flex justify-center pb-6 md:pb-8 pt-16 z-20 pointer-events-none bg-gradient-to-t from-black/80 via-black/40 to-transparent">
                 <span className="text-white/80 text-sm md:text-base px-6 truncate max-w-2xl text-center drop-shadow-md">
                     {photo.alt}

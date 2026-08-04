@@ -104,12 +104,22 @@
 
 /* Image inside each photo */
 .react-photo-album--image {
-  transition: transform 0.5s ease, filter 0.5s ease !important;
+  transition: transform 0.5s ease, filter 0.5s ease, opacity 0.35s ease !important;
 }
 
 .react-photo-album--button:hover .react-photo-album--image {
   transform: scale(1.08) !important;
   filter: brightness(1.06) !important;
+}
+
+/* Lazy-load fade-in */
+.rpa-lazy-img {
+  opacity: 0;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.rpa-lazy-img.is-loaded {
+  opacity: 1;
 }
 
 /* ── Extras (PhotoExtras component) ──────────────────────────────────────── */

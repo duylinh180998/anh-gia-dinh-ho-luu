@@ -3,6 +3,7 @@ import { useDropzone } from 'react-dropzone';
 import { PutObjectCommand } from '@aws-sdk/client-s3';
 import toast from 'react-hot-toast';
 import { s3Client, BUCKET_NAME } from '../aws-config';
+import { createImageVariants, toThumbKey } from '../utils/images';
 
 const ACCEPTED_TYPES = {
     'image/jpeg': ['.jpg', '.jpeg'],
@@ -12,9 +13,10 @@ const ACCEPTED_TYPES = {
     'image/avif': ['.avif'],
 };
 
-function generateS3Key(file) {
-    const sanitized = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
-    return `2026/${Date.now()}-${Math.random().toString(36).slice(2, 7)}-${sanitized}`;
+function generateS3Key(file, ext) {
+    const base = file.name.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9._-]/g, '_');
+    const suffix = ext.startsWith('.') ? ext : `.${ext}`;
+    return `2026/${Date.now()}-${Math.random().toString(36).slice(2, 7)}-${base}${suffix}`;
 }
 
 /**
@@ -76,20 +78,41 @@ export default function ImageUploader({ onUploadSuccess }) {
 
         await Promise.all(
             pending.map(async (item) => {
-                const key = generateS3Key(item.file);
                 try {
-                    // Convert File object to ArrayBuffer then Uint8Array to avoid AWS SDK v3 browser stream reading bugs
-                    const arrayBuffer = await item.file.arrayBuffer();
-                    const bodyData = new Uint8Array(arrayBuffer);
+                    // One decode → web-optimized full (≤2560px) + small thumb
+                    const variants = await createImageVariants(item.file);
+                    const key = generateS3Key(item.file, variants.full.ext);
+                    const thumbKey = toThumbKey(key);
+                    const meta = {
+                        width: String(variants.width),
+                        height: String(variants.height),
+                    };
 
-                    await s3Client.send(
-                        new PutObjectCommand({
-                            Bucket: BUCKET_NAME,
-                            Key: key,
-                            Body: bodyData,
-                            ContentType: item.file.type,
-                        })
-                    );
+                    const [fullData, thumbData] = await Promise.all([
+                        variants.full.blob.arrayBuffer().then((b) => new Uint8Array(b)),
+                        variants.thumb.blob.arrayBuffer().then((b) => new Uint8Array(b)),
+                    ]);
+
+                    await Promise.all([
+                        s3Client.send(
+                            new PutObjectCommand({
+                                Bucket: BUCKET_NAME,
+                                Key: key,
+                                Body: fullData,
+                                ContentType: variants.full.contentType,
+                                Metadata: meta,
+                            })
+                        ),
+                        s3Client.send(
+                            new PutObjectCommand({
+                                Bucket: BUCKET_NAME,
+                                Key: thumbKey,
+                                Body: thumbData,
+                                ContentType: variants.thumb.contentType,
+                                Metadata: meta,
+                            })
+                        ),
+                    ]);
                     setQueue((prev) =>
                         prev.map((i) => (i.id === item.id ? { ...i, status: 'done' } : i))
                     );
